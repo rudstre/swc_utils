@@ -1,36 +1,13 @@
 #!/usr/bin/env python3
 
-"""
-Slurm cluster resource dashboard.
+"""Slurm resource dashboard; one sinfo and one squeue query per refresh.
 
-Controller queries per refresh:
-    1x sinfo
-    1x squeue
-
-Everything else is processed locally.
-
-Examples:
-    sdash
-    sdash --all
-    sdash --watch 5
-    sdash --watch 5 --all
-    sdash --no-color
-
-Notes:
-    --all=false
-        Show only partitions that sinfo exposes to the current user's groups.
-        This is a lightweight approximation of "partitions I can allocate on".
-        It does not test account/QOS/reservation-specific salloc policy.
-
-    By default, --all is set to false.
-
-    squeue is always queried with --all because a job running through a
-    partition you cannot access may still consume resources on a physical
-    node belonging to a partition you can access.
+By default sinfo shows partitions visible to the current user's groups. This
+does not account for account, QOS, or reservation policy. squeue uses --all
+because jobs in other partitions can occupy shared physical nodes.
 """
 
 from __future__ import annotations
-
 import argparse
 import math
 import os
@@ -38,15 +15,9 @@ import re
 import subprocess
 import sys
 import time
-
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
-
-
-# =============================================================================
-# Display configuration
-# =============================================================================
 
 NODE_WIDTH = 16
 STATE_WIDTH = 24
@@ -55,8 +26,6 @@ RAM_WIDTH = 22
 GPU_WIDTH = 34
 USERS_WIDTH = 28
 RELEASE_MIN_WIDTH = 20
-
-
 GPU_NAMES = {
     "a100": "A100",
     "h100": "H100",
@@ -68,77 +37,24 @@ GPU_NAMES = {
     "nvidia_geforce_rtx_2080": "RTX 2080",
     "nvidia_rtx_4000_ada_generation": "RTX 4000 Ada",
 }
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+WHITE = "\x1b[38;5;255m"
+CYAN = "\x1b[38;5;51m"
+GREEN_0 = "\x1b[38;5;46m"
+GREEN_1 = "\x1b[38;5;82m"
+GREEN_2 = "\x1b[38;5;118m"
+YELLOW = "\x1b[38;5;226m"
+ORANGE_1 = "\x1b[38;5;214m"
+ORANGE_2 = "\x1b[38;5;208m"
+RED = "\x1b[38;5;196m"
+GREY = "\x1b[38;5;250m"
+# Explicit delimiters avoid ambiguity in Slurm's padded --Format fields.
+# CPUsState is allocated/idle/other/total; memory fields are MiB.
+SINFO_FORMAT = "NodeList:128|,PartitionName:128|,Available:16|,StateComplete:128|,CPUsState:64|,Memory:32|,AllocMem:32|,Gres:512|,GresUsed:512"
+SQUEUE_FORMAT = "JobID:64|,UserName:64|,State:32|,TimeLeft:32|,NodeList:512|,tres-alloc:1024|,tres-per-node:1024"
+JOB_STATES = "RUNNING,COMPLETING,CONFIGURING,STOPPED,SUSPENDED"
 
-
-# =============================================================================
-# ANSI colors
-# =============================================================================
-
-RESET = "\033[0m"
-BOLD = "\033[1m"
-WHITE = "\033[38;5;255m"
-CYAN = "\033[38;5;51m"
-
-GREEN_0 = "\033[38;5;46m"
-GREEN_1 = "\033[38;5;82m"
-GREEN_2 = "\033[38;5;118m"
-YELLOW = "\033[38;5;226m"
-ORANGE_1 = "\033[38;5;214m"
-ORANGE_2 = "\033[38;5;208m"
-RED = "\033[38;5;196m"
-GREY = "\033[38;5;250m"
-
-
-# =============================================================================
-# Slurm queries
-# =============================================================================
-
-# CPUsState is:
-#
-#     allocated / idle / other / total
-#
-# Memory and AllocMem are MiB.
-#
-# StateComplete includes all node-state flags.
-#
-# The "|" after each field is a literal delimiter added by sinfo.
-SINFO_FORMAT = (
-    "NodeList:128|,"
-    "PartitionName:128|,"
-    "Available:16|,"
-    "StateComplete:128|,"
-    "CPUsState:64|,"
-    "Memory:32|,"
-    "AllocMem:32|,"
-    "Gres:512|,"
-    "GresUsed:512"
-)
-
-
-SQUEUE_FORMAT = (
-    "JobID:64|,"
-    "UserName:64|,"
-    "State:32|,"
-    "TimeLeft:32|,"
-    "NodeList:512|,"
-    "tres-alloc:1024|,"
-    "tres-per-node:1024"
-)
-
-
-# Jobs in these states may still own node resources.
-JOB_STATES = (
-    "RUNNING,"
-    "COMPLETING,"
-    "CONFIGURING,"
-    "STOPPED,"
-    "SUSPENDED"
-)
-
-
-# =============================================================================
-# Data model
-# =============================================================================
 
 @dataclass
 class Release:
@@ -150,29 +66,15 @@ class Release:
 @dataclass
 class Node:
     name: str
-
     state: str = "UNKNOWN"
-
     cpu_alloc: int = 0
     cpu_total: int = 0
-
     mem_alloc: int = 0
     mem_total: int = 0
-
     gres: str = ""
     gres_used: str = ""
-
-    # partition -> partition availability
-    #
-    # Example:
-    #     {
-    #         "cpu": "up",
-    #         "short": "up",
-    #     }
     partitions: dict[str, str] = field(default_factory=dict)
-
     users: set[str] = field(default_factory=set)
-
     next_any: Optional[Release] = None
     next_gpu: Optional[Release] = None
 
@@ -187,36 +89,25 @@ class GpuSummary:
 
 @dataclass
 class Row:
-    partition: str
-    partition_available: str
     node: Node
-
     offline: bool
     occupancy: int
-
     state_display: str
     cpu_display: str
     mem_display: str
     gpu_display: str
     users_display: str
     release_display: str
-
     gpu_used: int
     gpu_total: int
 
-
-# =============================================================================
-# General helpers
-# =============================================================================
 
 def run_command(args: list[str]) -> str:
     """
     Run a Slurm client command using a predictable locale.
     """
-
     env = os.environ.copy()
     env["LC_ALL"] = "C"
-
     try:
         result = subprocess.run(
             args,
@@ -226,63 +117,43 @@ def run_command(args: list[str]) -> str:
             text=True,
             env=env,
         )
-
     except FileNotFoundError:
-        raise RuntimeError(
-            f"Command not found: {args[0]}"
-        ) from None
-
+        raise RuntimeError(f"Command not found: {args[0]}") from None
     except subprocess.CalledProcessError as exc:
-        message = (
-            exc.stderr.strip()
-            or exc.stdout.strip()
-            or "unknown error"
-        )
-
+        message = exc.stderr.strip() or exc.stdout.strip() or "unknown error"
         raise RuntimeError(
-            f"{args[0]} failed with exit code "
-            f"{exc.returncode}: {message}"
+            f"{args[0]} failed with exit code {exc.returncode}: {message}"
         ) from None
-
     return result.stdout
 
 
 def parse_int(value: str, default: int = 0) -> int:
     value = value.strip()
-
     if value.isdigit():
         return int(value)
-
     return default
 
 
 def percentage(used: int, total: int) -> int:
     if total <= 0:
         return 0
-
     return 100 * used // total
 
 
 def clip(text: str, width: int) -> str:
     """
     Hard-cap a string to the specified display width.
-
     Python/printf field widths are minimum widths, not maximum widths, so
     clipping has to happen explicitly to prevent one column spilling into
     another.
     """
-
     text = str(text)
-
     if len(text) <= width:
         return text
-
     if width <= 0:
         return ""
-
     if width == 1:
         return "…"
-
     return text[: width - 1] + "…"
 
 
@@ -292,166 +163,88 @@ def natural_key(text: str):
         node2
         node3
         node10
-
     rather than:
         node10
         node2
         node3
     """
-
-    parts = re.split(r"(\d+)", text)
-
+    parts = re.split("(\\d+)", text)
     return tuple(
-        (0, int(part))
-        if part.isdigit()
-        else (1, part.lower())
-        for part in parts
+        ((0, int(part)) if part.isdigit() else (1, part.lower()) for part in parts)
     )
 
 
 def human_mem(mib: int) -> str:
     """
     Convert Slurm MiB values into compact human-readable units.
-
     The UI retains GB/TB labels for readability, while calculations use
     binary conversion factors.
     """
-
     if mib >= 1024 * 1024:
         return f"{mib / (1024 * 1024):.2f} TB"
-
     return f"{mib / 1024:.0f} GB"
 
-
-# =============================================================================
-# Slurm hostlist expansion
-# =============================================================================
 
 def split_top_level(expr: str) -> list[str]:
     """
     Split commas that are not inside brackets.
-
     Example:
         "node[01-03],gpu[1-2]"
-
     becomes:
         ["node[01-03]", "gpu[1-2]"]
     """
-
     result = []
-
     depth = 0
     start = 0
-
     for i, char in enumerate(expr):
-
         if char == "[":
             depth += 1
-
         elif char == "]":
             depth -= 1
-
         elif char == "," and depth == 0:
             result.append(expr[start:i])
             start = i + 1
-
     result.append(expr[start:])
-
-    return [
-        part
-        for part in result
-        if part
-    ]
+    return [part for part in result if part]
 
 
 def expand_host_component(expr: str) -> list[str]:
     """
     Expand one Slurm hostlist component.
-
     Handles examples such as:
         node[01-03]
         node[01,03,08]
         node[01-10:2]
         rack[1-2]node[01-04]
     """
-
-    match = re.search(
-        r"\[([^\[\]]+)\]",
-        expr,
-    )
-
+    match = re.search("\\[([^\\[\\]]+)\\]", expr)
     if not match:
         return [expr]
-
     before = expr[: match.start()]
     inside = match.group(1)
     after = expr[match.end() :]
-
     replacements = []
-
     for item in inside.split(","):
-
         item = item.strip()
-
-        range_match = re.fullmatch(
-            r"(\d+)-(\d+)(?::(\d+))?",
-            item,
-        )
-
+        range_match = re.fullmatch("(\\d+)-(\\d+)(?::(\\d+))?", item)
         if not range_match:
             replacements.append(item)
             continue
-
         start_s, end_s, step_s = range_match.groups()
-
         start = int(start_s)
         end = int(end_s)
-
-        step = (
-            int(step_s)
-            if step_s
-            else 1
-        )
-
+        step = int(step_s) if step_s else 1
         if step <= 0:
             continue
-
-        width = max(
-            len(start_s),
-            len(end_s),
-        )
-
+        width = max(len(start_s), len(end_s))
         if start <= end:
-            values = range(
-                start,
-                end + 1,
-                step,
-            )
-
+            values = range(start, end + 1, step)
         else:
-            values = range(
-                start,
-                end - 1,
-                -step,
-            )
-
-        replacements.extend(
-            f"{value:0{width}d}"
-            for value in values
-        )
-
+            values = range(start, end - 1, -step)
+        replacements.extend((f"{value:0{width}d}" for value in values))
     result = []
-
     for replacement in replacements:
-
-        result.extend(
-            expand_host_component(
-                before
-                + replacement
-                + after
-            )
-        )
-
+        result.extend(expand_host_component(before + replacement + after))
     return result
 
 
@@ -459,391 +252,135 @@ def expand_hostlist(expr: str) -> list[str]:
     """
     Expand a complete Slurm NodeList expression.
     """
-
     if not expr:
         return []
-
     nodes = []
-
     for component in split_top_level(expr):
-
-        nodes.extend(
-            expand_host_component(component)
-        )
-
-    # Stable deduplication.
-    return list(
-        dict.fromkeys(nodes)
-    )
+        nodes.extend(expand_host_component(component))
+    return list(dict.fromkeys(nodes))
 
 
-# =============================================================================
-# Time handling
-# =============================================================================
+def parse_timeleft(value: str) -> Optional[tuple[int, int, int, int]]:
+    """Parse Slurm's D-HH:MM:SS, HH:MM:SS, or MM:SS forms."""
+    day, separator, clock = value.strip().partition("-")
+    if separator:
+        if not day.isdigit():
+            return None
+        days = int(day)
+    else:
+        days, clock = (0, day)
+    parts = clock.split(":")
+    if len(parts) not in (2, 3) or not all((part.isdigit() for part in parts)):
+        return None
+    if separator and len(parts) != 3:
+        return None
+    numbers = [int(part) for part in parts]
+    hours, minutes, seconds = [0] + numbers if len(numbers) == 2 else numbers
+    return (days, hours, minutes, seconds)
+
 
 def timeleft_seconds(value: str) -> Optional[float]:
-    """
-    Convert Slurm TimeLeft to seconds.
-
-    Returns:
-        None
-            Unknown / unusable time.
-
-        math.inf
-            UNLIMITED.
-
-        float/int
-            Remaining seconds.
-    """
-
-    value = value.strip().upper()
-
-    if not value:
-        return None
-
-    if value in {
-        "N/A",
-        "NOT_SET",
-        "INVALID",
-    }:
-        return None
-
-    if value == "UNLIMITED":
+    """Return seconds, infinity for UNLIMITED, or None for unknown time."""
+    if value.strip().upper() == "UNLIMITED":
         return math.inf
-
-    # D-HH:MM:SS
-    match = re.fullmatch(
-        r"(\d+)-(\d+):(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        days, hours, minutes, seconds = map(
-            int,
-            match.groups(),
-        )
-
-        return (
-            days * 86400
-            + hours * 3600
-            + minutes * 60
-            + seconds
-        )
-
-    # HH:MM:SS
-    match = re.fullmatch(
-        r"(\d+):(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        hours, minutes, seconds = map(
-            int,
-            match.groups(),
-        )
-
-        return (
-            hours * 3600
-            + minutes * 60
-            + seconds
-        )
-
-    # MM:SS
-    match = re.fullmatch(
-        r"(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        minutes, seconds = map(
-            int,
-            match.groups(),
-        )
-
-        return (
-            minutes * 60
-            + seconds
-        )
-
-    return None
+    parts = parse_timeleft(value)
+    if parts is None:
+        return None
+    days, hours, minutes, seconds = parts
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 def format_timeleft(value: str) -> str:
-    """
-    Convert Slurm TimeLeft into a compact dashboard representation.
-    """
-
+    """Convert Slurm TimeLeft into a compact dashboard representation."""
     value = value.strip()
-
-    if not value:
-        return "?"
-
     upper = value.upper()
-
-    if upper in {
-        "N/A",
-        "NOT_SET",
-        "INVALID",
-    }:
+    if upper in {"", "N/A", "NOT_SET", "INVALID"}:
         return "?"
-
     if upper == "UNLIMITED":
         return "unlimited"
-
-    # D-HH:MM:SS
-    match = re.fullmatch(
-        r"(\d+)-(\d+):(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        days, hours, minutes, _ = map(
-            int,
-            match.groups(),
-        )
-
-        if days:
-            return f"{days}d {hours}h"
-
-        if hours:
-            return f"{hours}h {minutes}m"
-
-        return f"{minutes}m"
-
-    # HH:MM:SS
-    match = re.fullmatch(
-        r"(\d+):(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        hours, minutes, _ = map(
-            int,
-            match.groups(),
-        )
-
-        if hours:
-            return f"{hours}h {minutes}m"
-
-        return f"{minutes}m"
-
-    # MM:SS
-    match = re.fullmatch(
-        r"(\d+):(\d+)",
-        value,
-    )
-
-    if match:
-
-        minutes, _ = map(
-            int,
-            match.groups(),
-        )
-
-        return f"{minutes}m"
-
-    return value
+    parts = parse_timeleft(value)
+    if parts is None:
+        return value
+    days, hours, minutes, _ = parts
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def update_release(
-    current: Optional[Release],
-    raw_time: str,
-    user: str,
+    current: Optional[Release], raw_time: str, user: str
 ) -> Optional[Release]:
     """
     Retain the earliest known release.
     """
-
     seconds = timeleft_seconds(raw_time)
-
     if seconds is None:
         return current
-
-    candidate = Release(
-        seconds=seconds,
-        raw_time=raw_time,
-        user=user,
-    )
-
+    candidate = Release(seconds=seconds, raw_time=raw_time, user=user)
     if current is None:
         return candidate
-
     if candidate.seconds < current.seconds:
         return candidate
-
     return current
 
 
-# =============================================================================
-# GPU parsing
-# =============================================================================
-
-# Configured / used GRES forms commonly look like:
-#
-#     gpu:4
-#     gpu:a100:4
-#     gpu:a100:4(S:0-1)
-#     gpu:a100:3(IDX:0-2)
-#
-GPU_GRES_RE = re.compile(
-    r"^gpu:"
-    r"(?:(?P<type>[^:,()]+):)?"
-    r"(?P<count>\d+)"
-)
+GPU_GRES_RE = re.compile(r"^gpu:(?:(?P<type>[^:,()]+):)?(?P<count>\d+)")
+GPU_TRES_RE = re.compile(r"(?:^|,)gres/gpu(?::[^=,]+)?=(?P<count>\d+)")
 
 
-# Allocated TRES commonly looks like:
-#
-#     cpu=16,mem=64G,gres/gpu=1
-#     cpu=16,gres/gpu:a100=2
-#
-GPU_TRES_RE = re.compile(
-    r"(?:^|,)"
-    r"gres/gpu"
-    r"(?::[^=,]+)?"
-    r"=(?P<count>\d+)"
-)
-
-
-def parse_gpu_gres(
-    gres: str,
-) -> dict[Optional[str], int]:
-    """
-    Parse GPU counts from a GRES string.
-
-    Return form:
-        {
-            "a100": 4,
-        }
-
-    or for untyped GPUs:
-        {
-            None: 4,
-        }
-    """
-
+def parse_gpu_gres(gres: str) -> dict[Optional[str], int]:
+    """Parse typed and untyped GPU counts from a GRES string."""
     result: dict[Optional[str], int] = defaultdict(int)
-
     gres = gres.strip()
-
     if not gres:
         return {}
-
-    if gres in {
-        "(null)",
-        "N/A",
-        "gpu:0",
-    }:
+    if gres in {"(null)", "N/A", "gpu:0"}:
         return {}
-
     for entry in gres.split(","):
-
         entry = entry.strip()
-
         match = GPU_GRES_RE.match(entry)
-
         if not match:
             continue
-
         gpu_type = match.group("type")
         count = int(match.group("count"))
-
         result[gpu_type] += count
-
     return dict(result)
 
 
-def pretty_gpu_name(
-    gpu_type: Optional[str],
-) -> str:
-
+def pretty_gpu_name(gpu_type: Optional[str]) -> str:
     if gpu_type is None:
         return "GPU"
-
-    return GPU_NAMES.get(
-        gpu_type,
-        gpu_type,
-    )
+    return GPU_NAMES.get(gpu_type, gpu_type)
 
 
-def gpu_summary(
-    gres: str,
-    gres_used: str,
-) -> GpuSummary:
-
+def gpu_summary(gres: str, gres_used: str) -> GpuSummary:
     configured = parse_gpu_gres(gres)
     used = parse_gpu_gres(gres_used)
-
     if not configured:
-
-        return GpuSummary(
-            display="—",
-            max_pct=0,
-            used_total=0,
-            total=0,
-        )
-
+        return GpuSummary(display="—", max_pct=0, used_total=0, total=0)
     pieces = []
-
     used_total = 0
     total_all = 0
     max_pct = 0
-
     for gpu_type, total in configured.items():
-
         if gpu_type in used:
-
             count_used = used[gpu_type]
-
         elif gpu_type is None:
-
-            # Node configuration reports generic GPUs, while GresUsed may
-            # report typed GPUs.
-            count_used = sum(
-                used.values()
-            )
-
+            # Generic configuration can have typed usage.
+            count_used = sum(used.values())
         elif None in used and len(configured) == 1:
-
-            # One explicit GPU type is configured, but usage was reported
-            # generically.
+            # A sole typed configuration can have generic usage.
             count_used = used[None]
-
         else:
-
             count_used = 0
-
-        count_used = max(
-            0,
-            min(
-                count_used,
-                total,
-            ),
-        )
-
-        current_pct = percentage(
-            count_used,
-            total,
-        )
-
-        max_pct = max(
-            max_pct,
-            current_pct,
-        )
-
+        count_used = max(0, min(count_used, total))
+        current_pct = percentage(count_used, total)
+        max_pct = max(max_pct, current_pct)
         used_total += count_used
         total_all += total
-
-        pieces.append(
-            f"{count_used}/{total} "
-            f"{pretty_gpu_name(gpu_type)}"
-        )
-
+        pieces.append(f"{count_used}/{total} {pretty_gpu_name(gpu_type)}")
     return GpuSummary(
         display=" + ".join(pieces),
         max_pct=max_pct,
@@ -856,31 +393,17 @@ def has_gpu_tres(value: str) -> bool:
     """
     Does a TRES field contain a non-zero GPU allocation/request?
     """
-
     for match in GPU_TRES_RE.finditer(value):
-
         if int(match.group("count")) > 0:
             return True
-
     return False
 
 
-# =============================================================================
-# Node-state handling
-# =============================================================================
-
-# Slurm may use abbreviated or historical state names in some outputs.
 STATE_ALIASES = {
     "NO_RESPOND": "NOT_RESPONDING",
     "INVAL": "INVALID_REG",
     "MAINT": "MAINTENANCE",
 }
-
-
-# These indicate that the node should not be presented as currently usable.
-#
-# POWERED_DOWN is handled separately because IDLE+POWERED_DOWN nodes on a
-# power-saving cluster can still be scheduler-available.
 UNAVAILABLE_STATES = {
     "BLOCKED",
     "COMPLETING",
@@ -906,140 +429,76 @@ UNAVAILABLE_STATES = {
 }
 
 
-def state_tokens(
-    state: str,
-) -> set[str]:
-
+def state_tokens(state: str) -> set[str]:
     result = set()
-
     for token in state.upper().split("+"):
-
         token = token.strip()
-
         if not token:
             continue
-
-        token = STATE_ALIASES.get(
-            token,
-            token,
-        )
-
+        token = STATE_ALIASES.get(token, token)
         result.add(token)
-
     return result
 
 
-def is_idle_powered_down(
-    state: str,
-) -> bool:
+def is_idle_powered_down(state: str) -> bool:
     """
     IDLE+POWERED_DOWN is treated as usable scheduler capacity.
     """
-
     tokens = state_tokens(state)
-
     if "IDLE" not in tokens:
         return False
-
     if "POWERED_DOWN" not in tokens:
         return False
-
     if tokens & UNAVAILABLE_STATES:
         return False
-
     return True
 
 
-def node_unavailable(
-    state: str,
-) -> bool:
-
+def node_unavailable(state: str) -> bool:
     tokens = state_tokens(state)
-
     if is_idle_powered_down(state):
         return False
-
-    if (
-        "POWERED_DOWN" in tokens
-        and "IDLE" not in tokens
-    ):
+    if "POWERED_DOWN" in tokens and "IDLE" not in tokens:
         return True
-
-    return bool(
-        tokens & UNAVAILABLE_STATES
-    )
+    return bool(tokens & UNAVAILABLE_STATES)
 
 
-def display_state(
-    state: str,
-) -> str:
-
+def display_state(state: str) -> str:
     if is_idle_powered_down(state):
         return "IDLE"
-
     return state.upper()
 
 
-def partition_unavailable(
-    value: str,
-) -> bool:
-
-    return value.strip().lower() in {
-        "down",
-        "drain",
-        "inactive",
-        "inact",
-    }
+def partition_unavailable(value: str) -> bool:
+    return value.strip().lower() in {"down", "drain", "inactive", "inact"}
 
 
-# =============================================================================
-# Colors
-# =============================================================================
-
-def occupancy_color(
-    percent: int,
-) -> str:
-
+def occupancy_color(percent: int) -> str:
     if percent <= 0:
         return GREEN_0
-
     if percent <= 20:
         return GREEN_1
-
     if percent <= 40:
         return GREEN_2
-
     if percent <= 60:
         return YELLOW
-
     if percent <= 80:
         return ORANGE_1
-
     if percent < 100:
         return ORANGE_2
-
     return RED
 
 
-# =============================================================================
-# sinfo snapshot
-# =============================================================================
-
-def load_nodes(
-    all_nodes: bool,
-) -> dict[str, Node]:
+def load_nodes(all_nodes: bool) -> dict[str, Node]:
     """
     Fetch and parse the node/partition snapshot.
-
     all_nodes=True:
         sinfo --all
         Include hidden and group-inaccessible partitions.
-
     all_nodes=False:
         Do not use --all.
         Let sinfo's normal user/group filtering hide inaccessible partitions.
     """
-
     command = [
         "sinfo",
         "--local",
@@ -1049,30 +508,16 @@ def load_nodes(
         "--Format",
         SINFO_FORMAT,
     ]
-
     if all_nodes:
-        command.insert(
-            1,
-            "--all",
-        )
-
+        command.insert(1, "--all")
     output = run_command(command)
-
     nodes: dict[str, Node] = {}
-
     for raw_line in output.splitlines():
-
         if not raw_line.strip():
             continue
-
-        fields = [
-            field.strip()
-            for field in raw_line.split("|")
-        ]
-
+        fields = [field.strip() for field in raw_line.split("|")]
         if len(fields) < 9:
             continue
-
         (
             node_expr,
             partition,
@@ -1084,88 +529,39 @@ def load_nodes(
             gres,
             gres_used,
         ) = fields[:9]
-
         if not node_expr:
             continue
-
         try:
-            node_names = expand_hostlist(
-                node_expr
-            )
-
+            node_names = expand_hostlist(node_expr)
         except Exception:
-            # A malformed/unexpected hostlist should not kill the dashboard.
             node_names = [node_expr]
-
         cpu_alloc = 0
         cpu_total = 0
-
         cpu_parts = cpus_state.split("/")
-
         if len(cpu_parts) == 4:
-
-            cpu_alloc = parse_int(
-                cpu_parts[0]
-            )
-
-            cpu_total = parse_int(
-                cpu_parts[3]
-            )
-
-        parsed_total_mem = parse_int(
-            total_mem
-        )
-
-        parsed_alloc_mem = parse_int(
-            alloc_mem
-        )
-
+            cpu_alloc = parse_int(cpu_parts[0])
+            cpu_total = parse_int(cpu_parts[3])
+        parsed_total_mem = parse_int(total_mem)
+        parsed_alloc_mem = parse_int(alloc_mem)
         for node_name in node_names:
-
-            node = nodes.setdefault(
-                node_name,
-                Node(
-                    name=node_name,
-                ),
-            )
-
-            # Node-level resource/state fields should be identical regardless
-            # of which partition-membership row produced this node.
-            node.state = (
-                state
-                or "UNKNOWN"
-            )
-
+            node = nodes.setdefault(node_name, Node(name=node_name))
+            # One physical node can appear in several partition rows.
+            node.state = state or "UNKNOWN"
             node.cpu_alloc = cpu_alloc
             node.cpu_total = cpu_total
-
             node.mem_total = parsed_total_mem
             node.mem_alloc = parsed_alloc_mem
-
             node.gres = gres
             node.gres_used = gres_used
-
             if partition:
-
-                node.partitions[partition] = (
-                    partition_available
-                    or "unknown"
-                )
-
+                node.partitions[partition] = partition_available or "unknown"
     return nodes
 
 
-# =============================================================================
-# squeue snapshot
-# =============================================================================
-
-def load_jobs(
-    nodes: dict[str, Node],
-) -> None:
+def load_jobs(nodes: dict[str, Node]) -> None:
     """
     Add user and release-time information from one cached squeue snapshot.
     """
-
     output = run_command(
         [
             "squeue",
@@ -1178,380 +574,116 @@ def load_jobs(
             SQUEUE_FORMAT,
         ]
     )
-
     for raw_line in output.splitlines():
-
         if not raw_line.strip():
             continue
-
-        fields = [
-            field.strip()
-            for field in raw_line.split("|")
-        ]
-
+        fields = [field.strip() for field in raw_line.split("|")]
         if len(fields) < 7:
             continue
-
-        (
-            job_id,
-            user,
-            job_state,
-            timeleft,
-            nodelist,
-            tres_alloc,
-            tres_per_node,
-        ) = fields[:7]
-
+        job_id, user, job_state, timeleft, nodelist, tres_alloc, tres_per_node = fields[
+            :7
+        ]
         if not job_id:
             continue
-
         if not user:
             continue
-
         if not nodelist:
             continue
-
-        # Pending/reason-style values are not hostlists.
         if nodelist.startswith("("):
             continue
-
         try:
-            job_nodes = expand_hostlist(
-                nodelist
-            )
-
+            job_nodes = expand_hostlist(nodelist)
         except Exception:
             continue
-
-        # tres-per-node is preferable when present because it describes a
-        # per-node GPU request. Fall back to the whole-job allocation.
-        uses_gpu = (
-            has_gpu_tres(tres_per_node)
-            or has_gpu_tres(tres_alloc)
-        )
-
+        uses_gpu = has_gpu_tres(tres_per_node) or has_gpu_tres(tres_alloc)
         for node_name in job_nodes:
-
             node = nodes.get(node_name)
-
-            # If --all=False removed this physical node entirely,
-            # there is nothing to display or aggregate.
             if node is None:
                 continue
-
             node.users.add(user)
-
-            node.next_any = update_release(
-                node.next_any,
-                timeleft,
-                user,
-            )
-
+            node.next_any = update_release(node.next_any, timeleft, user)
             if uses_gpu:
-
-                # Caveat:
-                #
-                # For an unusual heterogeneous multi-node allocation,
-                # job-level AllocTRES does not necessarily identify exactly
-                # which node owns which GPU. For normal homogeneous GPU jobs,
-                # this produces the expected result.
-                node.next_gpu = update_release(
-                    node.next_gpu,
-                    timeleft,
-                    user,
-                )
+                # Job-level TRES can be imprecise for heterogeneous allocations.
+                node.next_gpu = update_release(node.next_gpu, timeleft, user)
 
 
-# =============================================================================
-# Build display rows
-# =============================================================================
-
-def make_row(
-    node: Node,
-    partition: str,
-    partition_available: str,
-) -> Row:
-
-    cpu_pct = percentage(
-        node.cpu_alloc,
-        node.cpu_total,
-    )
-
-    mem_pct = percentage(
-        node.mem_alloc,
-        node.mem_total,
-    )
-
-    gpu = gpu_summary(
-        node.gres,
-        node.gres_used,
-    )
-
-    occupancy = max(
-        cpu_pct,
-        mem_pct,
-        gpu.max_pct,
-    )
-
-    offline = (
-        node_unavailable(node.state)
-        or partition_unavailable(
-            partition_available
-        )
-    )
-
-    state_h = display_state(
-        node.state
-    )
-
-    cpu_h = (
-        f"{node.cpu_alloc}/"
-        f"{node.cpu_total}"
-    )
-
-    mem_h = (
-        f"{human_mem(node.mem_alloc)}"
-        f" / "
-        f"{human_mem(node.mem_total)}"
-    )
-
-    users_h = (
-        ",".join(
-            sorted(
-                node.users,
-                key=str.lower,
-            )
-        )
-        if node.users
-        else "-"
-    )
-
-    cpu_full = (
-        node.cpu_total > 0
-        and node.cpu_alloc >= node.cpu_total
-    )
-
-    mem_full = (
-        node.mem_total > 0
-        and node.mem_alloc >= node.mem_total
-    )
-
-    gpu_full = (
-        gpu.total > 0
-        and gpu.used_total >= gpu.total
-    )
-
+def make_row(node: Node, partition_available: str) -> Row:
+    cpu_pct = percentage(node.cpu_alloc, node.cpu_total)
+    mem_pct = percentage(node.mem_alloc, node.mem_total)
+    gpu = gpu_summary(node.gres, node.gres_used)
+    occupancy = max(cpu_pct, mem_pct, gpu.max_pct)
+    offline = node_unavailable(node.state) or partition_unavailable(partition_available)
+    state_h = display_state(node.state)
+    cpu_h = f"{node.cpu_alloc}/{node.cpu_total}"
+    mem_h = f"{human_mem(node.mem_alloc)} / {human_mem(node.mem_total)}"
+    users_h = ",".join(sorted(node.users, key=str.lower)) if node.users else "-"
+    cpu_full = node.cpu_total > 0 and node.cpu_alloc >= node.cpu_total
+    mem_full = node.mem_total > 0 and node.mem_alloc >= node.mem_total
+    gpu_full = gpu.total > 0 and gpu.used_total >= gpu.total
     release_h = "—"
-
-    # For a GPU-saturated node, the useful release is specifically the next
-    # GPU job to finish.
     if gpu_full:
-
-        if node.next_gpu is not None:
-
-            release_h = (
-                f"{format_timeleft(node.next_gpu.raw_time)} "
-                f"({node.next_gpu.user})"
-            )
-
-        else:
-
-            release_h = "?"
-
-    # Otherwise, if CPU or memory is saturated, show the next job of any kind.
+        # A GPU job's end is the useful estimate for a full GPU node.
+        release = node.next_gpu
     elif cpu_full or mem_full:
-
-        if node.next_any is not None:
-
-            release_h = (
-                f"{format_timeleft(node.next_any.raw_time)} "
-                f"({node.next_any.user})"
-            )
-
-        else:
-
-            release_h = "?"
-
+        release = node.next_any
+    else:
+        release = None
+    if gpu_full or cpu_full or mem_full:
+        release_h = (
+            f"{format_timeleft(release.raw_time)} ({release.user})" if release else "?"
+        )
     return Row(
-        partition=partition,
-        partition_available=partition_available,
         node=node,
-
         offline=offline,
         occupancy=occupancy,
-
-        state_display=clip(
-            state_h,
-            STATE_WIDTH,
-        ),
-
-        cpu_display=clip(
-            cpu_h,
-            CPU_WIDTH,
-        ),
-
-        mem_display=clip(
-            mem_h,
-            RAM_WIDTH,
-        ),
-
-        gpu_display=clip(
-            gpu.display,
-            GPU_WIDTH,
-        ),
-
-        users_display=clip(
-            users_h,
-            USERS_WIDTH,
-        ),
-
+        state_display=clip(state_h, STATE_WIDTH),
+        cpu_display=clip(cpu_h, CPU_WIDTH),
+        mem_display=clip(mem_h, RAM_WIDTH),
+        gpu_display=clip(gpu.display, GPU_WIDTH),
+        users_display=clip(users_h, USERS_WIDTH),
         release_display=release_h,
-
         gpu_used=gpu.used_total,
         gpu_total=gpu.total,
     )
 
 
-def build_rows(
-    nodes: dict[str, Node],
-) -> dict[str, list[Row]]:
-
+def build_rows(nodes: dict[str, Node]) -> dict[str, list[Row]]:
     by_partition: dict[str, list[Row]] = defaultdict(list)
-
     for node in nodes.values():
-
-        # Normally every node from sinfo has at least one partition.
-        # Retain this fallback so unusual Slurm configurations are visible
-        # rather than silently disappearing.
         if not node.partitions:
-
-            by_partition["-"].append(
-                make_row(
-                    node,
-                    "-",
-                    "unknown",
-                )
-            )
-
+            by_partition["-"].append(make_row(node, "unknown"))
             continue
-
-        for (
-            partition,
-            available,
-        ) in node.partitions.items():
-
-            by_partition[partition].append(
-                make_row(
-                    node,
-                    partition,
-                    available,
-                )
-            )
-
+        for partition, available in node.partitions.items():
+            by_partition[partition].append(make_row(node, available))
     for rows in by_partition.values():
-
-        # Online low-occupancy nodes first.
-        # Offline/unavailable nodes last.
         rows.sort(
             key=lambda row: (
                 row.offline,
-                (
-                    row.occupancy
-                    if not row.offline
-                    else 999
-                ),
-                natural_key(
-                    row.node.name
-                ),
+                row.occupancy if not row.offline else 999,
+                natural_key(row.node.name),
             )
         )
-
     return dict(by_partition)
 
 
-# =============================================================================
-# Rendering
-# =============================================================================
-
-def ansi(
-    value: str,
-    enabled: bool,
-) -> str:
-
-    return (
-        value
-        if enabled
-        else ""
-    )
+def ansi(value: str, enabled: bool) -> str:
+    return value if enabled else ""
 
 
-def render_partition(
-    partition: str,
-    rows: list[Row],
-    color_enabled: bool,
-) -> list[str]:
-
+def render_partition(partition: str, rows: list[Row], color_enabled: bool) -> list[str]:
     lines = []
-
     node_count = len(rows)
-
-    offline_count = sum(
-        1
-        for row in rows
-        if row.offline
-    )
-
-    available_count = (
-        node_count
-        - offline_count
-    )
-
-    cpu_used = sum(
-        row.node.cpu_alloc
-        for row in rows
-    )
-
-    cpu_total = sum(
-        row.node.cpu_total
-        for row in rows
-    )
-
-    mem_used = sum(
-        row.node.mem_alloc
-        for row in rows
-    )
-
-    mem_total = sum(
-        row.node.mem_total
-        for row in rows
-    )
-
-    gpu_used = sum(
-        row.gpu_used
-        for row in rows
-    )
-
-    gpu_total = sum(
-        row.gpu_total
-        for row in rows
-    )
-
-    cpu_summary_pct = percentage(
-        cpu_used,
-        cpu_total,
-    )
-
-    mem_summary_pct = percentage(
-        mem_used,
-        mem_total,
-    )
-
-    gpu_summary_pct = percentage(
-        gpu_used,
-        gpu_total,
-    )
-
-    # Six spaces separate the seven columns.
+    offline_count = sum((1 for row in rows if row.offline))
+    available_count = node_count - offline_count
+    cpu_used = sum((row.node.cpu_alloc for row in rows))
+    cpu_total = sum((row.node.cpu_total for row in rows))
+    mem_used = sum((row.node.mem_alloc for row in rows))
+    mem_total = sum((row.node.mem_total for row in rows))
+    gpu_used = sum((row.gpu_used for row in rows))
+    gpu_total = sum((row.gpu_total for row in rows))
+    cpu_summary_pct = percentage(cpu_used, cpu_total)
+    mem_summary_pct = percentage(mem_used, mem_total)
+    gpu_summary_pct = percentage(gpu_used, gpu_total)
     divider_width = (
         NODE_WIDTH
         + STATE_WIDTH
@@ -1562,336 +694,105 @@ def render_partition(
         + RELEASE_MIN_WIDTH
         + 6
     )
-
-    divider = (
-        "═"
-        * divider_width
-    )
-
-    b = ansi(
-        BOLD,
-        color_enabled,
-    )
-
-    c = ansi(
-        CYAN,
-        color_enabled,
-    )
-
-    w = ansi(
-        WHITE,
-        color_enabled,
-    )
-
-    r = ansi(
-        RESET,
-        color_enabled,
-    )
-
+    divider = "═" * divider_width
+    b = ansi(BOLD, color_enabled)
+    c = ansi(CYAN, color_enabled)
+    w = ansi(WHITE, color_enabled)
+    r = ansi(RESET, color_enabled)
     lines.append("")
-
-    lines.append(
-        f"{b}{c}"
-        f"{divider}"
-        f"{r}"
-    )
-
-    lines.append(
-        f"{b}{w}"
-        f"  {partition.upper()}"
-        f"{r}"
-    )
-
-    summary = (
-        f"  Nodes: {node_count}"
-    )
-
+    lines.append(f"{b}{c}{divider}{r}")
+    lines.append(f"{b}{w}  {partition.upper()}{r}")
+    summary = f"  Nodes: {node_count}"
     if offline_count:
-
-        summary += (
-            f"  ({available_count} available, "
-            f"{offline_count} offline)"
-        )
-
+        summary += f"  ({available_count} available, {offline_count} offline)"
     else:
-
-        summary += (
-            f"  ({available_count} available)"
-        )
-
+        summary += f"  ({available_count} available)"
+    summary += f"   │   CPU: {cpu_used}/{cpu_total} ({cpu_summary_pct}%)"
     summary += (
-        f"   │   CPU: "
-        f"{cpu_used}/{cpu_total} "
-        f"({cpu_summary_pct}%)"
+        f"   │   RAM: {human_mem(mem_used)}/{human_mem(mem_total)} ({mem_summary_pct}%)"
     )
-
-    summary += (
-        f"   │   RAM: "
-        f"{human_mem(mem_used)}/"
-        f"{human_mem(mem_total)} "
-        f"({mem_summary_pct}%)"
-    )
-
     if gpu_total:
-
-        summary += (
-            f"   │   GPU: "
-            f"{gpu_used}/{gpu_total} "
-            f"({gpu_summary_pct}%)"
-        )
-
+        summary += f"   │   GPU: {gpu_used}/{gpu_total} ({gpu_summary_pct}%)"
     lines.append(summary)
-
-    lines.append(
-        f"{b}{c}"
-        f"{divider}"
-        f"{r}"
-    )
-
-    header = (
-        f"{'NODE':<{NODE_WIDTH}} "
-        f"{'STATE':<{STATE_WIDTH}} "
-        f"{'CPU USED':<{CPU_WIDTH}} "
-        f"{'RAM USED':<{RAM_WIDTH}} "
-        f"{'GPU USED':<{GPU_WIDTH}} "
-        f"{'USERS':<{USERS_WIDTH}} "
-        f"NEXT RELEASE"
-    )
-
-    lines.append(
-        f"{b}"
-        f"{header}"
-        f"{r}"
-    )
-
+    lines.append(f"{b}{c}{divider}{r}")
+    header = f"{'NODE':<{NODE_WIDTH}} {'STATE':<{STATE_WIDTH}} {'CPU USED':<{CPU_WIDTH}} {'RAM USED':<{RAM_WIDTH}} {'GPU USED':<{GPU_WIDTH}} {'USERS':<{USERS_WIDTH}} NEXT RELEASE"
+    lines.append(f"{b}{header}{r}")
     for row in rows:
-
         if row.offline:
-
             row_color = GREY
-
         else:
-
-            row_color = occupancy_color(
-                row.occupancy
-            )
-
-        row_color = ansi(
-            row_color,
-            color_enabled,
-        )
-
-        node_display = clip(
-            row.node.name,
-            NODE_WIDTH,
-        )
-
-        line = (
-            f"{node_display:<{NODE_WIDTH}} "
-            f"{row.state_display:<{STATE_WIDTH}} "
-            f"{row.cpu_display:<{CPU_WIDTH}} "
-            f"{row.mem_display:<{RAM_WIDTH}} "
-            f"{row.gpu_display:<{GPU_WIDTH}} "
-            f"{row.users_display:<{USERS_WIDTH}} "
-            f"{row.release_display}"
-        )
-
-        lines.append(
-            f"{row_color}"
-            f"{line}"
-            f"{r}"
-        )
-
+            row_color = occupancy_color(row.occupancy)
+        row_color = ansi(row_color, color_enabled)
+        node_display = clip(row.node.name, NODE_WIDTH)
+        line = f"{node_display:<{NODE_WIDTH}} {row.state_display:<{STATE_WIDTH}} {row.cpu_display:<{CPU_WIDTH}} {row.mem_display:<{RAM_WIDTH}} {row.gpu_display:<{GPU_WIDTH}} {row.users_display:<{USERS_WIDTH}} {row.release_display}"
+        lines.append(f"{row_color}{line}{r}")
     return lines
 
 
-def render(
-    nodes: dict[str, Node],
-    color_enabled: bool,
-) -> str:
-
-    by_partition = build_rows(
-        nodes
-    )
-
+def render(nodes: dict[str, Node], color_enabled: bool) -> str:
+    by_partition = build_rows(nodes)
     lines = []
-
-    for partition in sorted(
-        by_partition,
-        key=natural_key,
-    ):
-
+    for partition in sorted(by_partition, key=natural_key):
         lines.extend(
-            render_partition(
-                partition,
-                by_partition[partition],
-                color_enabled,
-            )
+            render_partition(partition, by_partition[partition], color_enabled)
         )
-
     if not lines:
-
-        return (
-            "No visible Slurm nodes/partitions."
-        )
-
+        return "No visible Slurm nodes/partitions."
     return "\n".join(lines)
 
 
-# =============================================================================
-# Snapshot
-# =============================================================================
-
-def snapshot(
-    color_enabled: bool,
-    all_nodes: bool,
-) -> str:
-
-    nodes = load_nodes(
-        all_nodes=all_nodes,
-    )
-
+def snapshot(color_enabled: bool, all_nodes: bool) -> str:
+    nodes = load_nodes(all_nodes=all_nodes)
     load_jobs(nodes)
+    return render(nodes, color_enabled)
 
-    return render(
-        nodes,
-        color_enabled,
-    )
-
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 def parse_args() -> argparse.Namespace:
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Slurm cluster resource dashboard"
-        )
-    )
-
+    parser = argparse.ArgumentParser(description="Slurm cluster resource dashboard")
     parser.add_argument(
         "-w",
         "--watch",
         type=float,
         metavar="SECONDS",
-        help=(
-            "refresh continuously at this interval"
-        ),
+        help="refresh continuously at this interval",
     )
-
     parser.add_argument(
         "-a",
-	"--all",
+        "--all",
         action="store_true",
-        help=(
-            "show all partitions exposed by Slurm "
-            "regardless of whether current user can access them"
-        ),
+        help="show all partitions exposed by Slurm regardless of whether current user can access them",
     )
-
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help=(
-            "disable ANSI colors"
-        ),
-    )
-
+    parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args()
-
-    if (
-        args.watch is not None
-        and args.watch <= 0
-    ):
-
-        parser.error(
-            "--watch must be greater than zero"
-        )
-
+    if args.watch is not None and args.watch <= 0:
+        parser.error("--watch must be greater than zero")
     return args
 
 
 def main() -> int:
-
     args = parse_args()
-
     color_enabled = (
-        not args.no_color
-        and sys.stdout.isatty()
-        and "NO_COLOR" not in os.environ
+        not args.no_color and sys.stdout.isatty() and ("NO_COLOR" not in os.environ)
     )
-
-    # -------------------------------------------------------------------------
-    # One-shot mode
-    # -------------------------------------------------------------------------
-
     if args.watch is None:
-
         try:
-
-            print(
-                snapshot(
-                    color_enabled=color_enabled,
-                    all_nodes=args.all,
-                )
-            )
-
+            print(snapshot(color_enabled=color_enabled, all_nodes=args.all))
         except RuntimeError as exc:
-
-            print(
-                f"Error: {exc}",
-                file=sys.stderr,
-            )
-
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
-
         return 0
-
-    # -------------------------------------------------------------------------
-    # Watch mode
-    # -------------------------------------------------------------------------
-
     try:
-
         while True:
-
             try:
-
-                output = snapshot(
-                    color_enabled=color_enabled,
-                    all_nodes=args.all,
-                )
-
-                # Clear terminal and return cursor to the top-left.
-                print(
-                    "\033[2J\033[H",
-                    end="",
-                )
-
+                output = snapshot(color_enabled=color_enabled, all_nodes=args.all)
+                print("\x1b[2J\x1b[H", end="")
                 print(output)
-
                 sys.stdout.flush()
-
             except RuntimeError as exc:
-
-                print(
-                    "\033[2J\033[H",
-                    end="",
-                )
-
-                print(
-                    f"Slurm dashboard error: {exc}",
-                    file=sys.stderr,
-                )
-
-            time.sleep(
-                args.watch
-            )
-
+                print("\x1b[2J\x1b[H", end="")
+                print(f"Slurm dashboard error: {exc}", file=sys.stderr)
+            time.sleep(args.watch)
     except KeyboardInterrupt:
-
         return 0
 
 
